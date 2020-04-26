@@ -15,6 +15,9 @@ PB_BIND(Data, Data, 2)
 PB_BIND(User, User, AUTO)
 
 
+PB_BIND(RouteDiscovery, RouteDiscovery, AUTO)
+
+
 PB_BIND(SubPacket, SubPacket, 2)
 
 
@@ -37,6 +40,9 @@ PB_BIND(MyNodeInfo, MyNodeInfo, AUTO)
 
 
 PB_BIND(DeviceState, DeviceState, 4)
+
+
+PB_BIND(DebugString, DebugString, 2)
 
 
 PB_BIND(FromRadio, FromRadio, 2)

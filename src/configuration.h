@@ -31,8 +31,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 // If app version is not specified we assume we are not being invoked by the build script
 #ifndef APP_VERSION
-#define APP_VERSION 0.0.0   // this def normally comes from build-all.sh
-#define HW_VERSION 1.0 - US // normally comes from build-all.sh and contains the region code
+#error APP_VERSION, HW_VERSION, and HW_VERSION_countryname must be set by the build environment
+//#define APP_VERSION 0.0.0   // this def normally comes from build-all.sh
+//#define HW_VERSION 1.0 - US // normally comes from build-all.sh and contains the region code
 #endif
 
 // -----------------------------------------------------------------------------
@@ -46,7 +47,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #endif
 
 #define DEBUG_PORT Serial  // Serial debug port
-#define SERIAL_BAUD 115200 // Serial debug baud rate
+#define SERIAL_BAUD 921600 // Serial debug baud rate
 
 #define REQUIRE_RADIO true // If true, we will fail to start if the radio is not found
 
@@ -72,6 +73,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // Flip the screen upside down by default as it makes more sense on T-BEAM
 // devices. Comment this out to not rotate screen 180 degrees.
 #define FLIP_SCREEN_VERTICALLY
+
+// DEBUG LED
+
+#define LED_INVERTED 0 // define as 1 if LED is active low (on)
 
 // -----------------------------------------------------------------------------
 // GPS
@@ -203,6 +208,20 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define HW_VENDOR "bare"
 
 #define NO_ESP32 // Don't use ESP32 libs (mainly bluetooth)
+
+// Turn off GPS code for now
+#undef GPS_RX_PIN
+#undef GPS_TX_PIN
+
+// FIXME, not yet ready for NRF52
+#define RTC_DATA_ATTR
+
+#define LED_PIN PIN_LED1 // LED1 on nrf52840-DK
+#define BUTTON_PIN PIN_BUTTON1
+
+// This board uses 0 to be mean LED on
+#undef LED_INVERTED
+#define LED_INVERTED 1
 
 #endif
 
