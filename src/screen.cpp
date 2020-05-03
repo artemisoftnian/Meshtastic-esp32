@@ -21,7 +21,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 #include <OLEDDisplay.h>
-#include <Wire.h>
 
 #include "GPS.h"
 #include "NodeDB.h"
@@ -55,7 +54,6 @@ static void drawBootScreen(OLEDDisplay *display, OLEDDisplayUiState *state, int1
     // draw an xbm image.
     // Please note that everything that should be transitioned
     // needs to be drawn relative to x and y
-
     display->drawXbm(x + 32, y, icon_width, icon_height, (const uint8_t *)icon_bits);
 
     display->setFont(ArialMT_Plain_16);
@@ -315,16 +313,16 @@ static void drawNodeInfo(OLEDDisplay *display, OLEDDisplayUiState *state, int16_
     const char *username = node->has_user ? node->user.long_name : "Unknown Name";
 
     static char signalStr[20];
-    snprintf(signalStr, sizeof(signalStr), "Signal: %d", node->snr);
+    snprintf(signalStr, sizeof(signalStr), "Signal: %.0f", node->snr);
 
     uint32_t agoSecs = sinceLastSeen(node);
     static char lastStr[20];
     if (agoSecs < 120) // last 2 mins?
-        snprintf(lastStr, sizeof(lastStr), "%d seconds ago", agoSecs);
+        snprintf(lastStr, sizeof(lastStr), "%u seconds ago", agoSecs);
     else if (agoSecs < 120 * 60) // last 2 hrs
-        snprintf(lastStr, sizeof(lastStr), "%d minutes ago", agoSecs / 60);
+        snprintf(lastStr, sizeof(lastStr), "%u minutes ago", agoSecs / 60);
     else
-        snprintf(lastStr, sizeof(lastStr), "%d hours ago", agoSecs / 60 / 60);
+        snprintf(lastStr, sizeof(lastStr), "%u hours ago", agoSecs / 60 / 60);
 
     static float simRadian;
     simRadian += 0.1; // For testing, have the compass spin unless both
@@ -384,7 +382,6 @@ void _screen_header()
     if (!disp)
         return;
 
-
     // Message count
     //snprintf(buffer, sizeof(buffer), "#%03d", ttn_get_count() % 1000);
     //display->setTextAlignment(TEXT_ALIGN_LEFT);
@@ -402,7 +399,7 @@ void _screen_header()
 }
 #endif
 
-Screen::Screen(uint8_t address, uint8_t sda, uint8_t scl) : cmdQueue(32), dispdev(address, sda, scl), ui(&dispdev) {}
+Screen::Screen(uint8_t address, int sda, int scl) : cmdQueue(32), dispdev(address, sda, scl), ui(&dispdev) {}
 
 void Screen::handleSetOn(bool on)
 {
@@ -412,6 +409,7 @@ void Screen::handleSetOn(bool on)
     if (on != screenOn) {
         if (on) {
             DEBUG_MSG("Turning on screen\n");
+            dispdev.displayOn();
             dispdev.displayOn();
         } else {
             DEBUG_MSG("Turning off screen\n");
@@ -423,6 +421,8 @@ void Screen::handleSetOn(bool on)
 
 void Screen::setup()
 {
+    PeriodicTask::setup();
+
     // We don't set useDisplay until setup() is called, because some boards have a declaration of this object but the device
     // is never found when probing i2c and therefore we don't call setup and never want to do (invalid) accesses to this device.
     useDisplay = true;
@@ -593,7 +593,7 @@ void Screen::handleStartBluetoothPinScreen(uint32_t pin)
 
     static FrameCallback btFrames[] = {drawFrameBluetooth};
 
-    snprintf(btPIN, sizeof(btPIN), "%06d", pin);
+    snprintf(btPIN, sizeof(btPIN), "%06u", pin);
 
     ui.disableAllIndicators();
     ui.setFrames(btFrames, 1);
