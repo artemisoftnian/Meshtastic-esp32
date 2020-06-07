@@ -23,6 +23,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <OLEDDisplay.h>
 
 #include "GPS.h"
+#include "MeshService.h"
 #include "NodeDB.h"
 #include "configuration.h"
 #include "fonts.h"
@@ -78,10 +79,12 @@ static void drawFrameBluetooth(OLEDDisplay *display, OLEDDisplayUiState *state, 
 /// Draw the last text message we received
 static void drawTextMessageFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
 {
+    displayedNodeNum = 0; // Not currently showing a node pane
+
     MeshPacket &mp = devicestate.rx_text_message;
     NodeInfo *node = nodeDB.getNode(mp.from);
     // DEBUG_MSG("drawing text message from 0x%x: %s\n", mp.from,
-    // mp.payload.variant.data.payload.bytes);
+    // mp.decoded.variant.data.decoded.bytes);
 
     // Demo for drawStringMaxWidth:
     // with the third parameter you can define the width after which words will
@@ -94,8 +97,8 @@ static void drawTextMessageFrame(OLEDDisplay *display, OLEDDisplayUiState *state
 
     // the max length of this buffer is much longer than we can possibly print
     static char tempBuf[96];
-    assert(mp.payload.has_data);
-    snprintf(tempBuf, sizeof(tempBuf), "         %s", mp.payload.data.payload.bytes);
+    assert(mp.decoded.which_payload == SubPacket_data_tag);
+    snprintf(tempBuf, sizeof(tempBuf), "         %s", mp.decoded.data.payload.bytes);
 
     display->drawStringMaxWidth(4 + x, 10 + y, 128, tempBuf);
 }
@@ -280,13 +283,16 @@ static float estimatedHeading(double lat, double lon)
 /// valid lat/lon
 static bool hasPosition(NodeInfo *n)
 {
-    return n->has_position && (n->position.latitude != 0 || n->position.longitude != 0);
+    return n->has_position && (n->position.latitude_i != 0 || n->position.longitude_i != 0);
 }
 
 /// We will skip one node - the one for us, so we just blindly loop over all
 /// nodes
 static size_t nodeIndex;
 static int8_t prevFrame = -1;
+
+/// Convert an integer GPS coords to a floating point
+#define DegD(i) (i * 1e-7)
 
 static void drawNodeInfo(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
 {
@@ -300,7 +306,12 @@ static void drawNodeInfo(OLEDDisplay *display, OLEDDisplayUiState *state, int16_
         if (n->num == nodeDB.getNodeNum()) {
             // Don't show our node, just skip to next
             nodeIndex = (nodeIndex + 1) % nodeDB.getNumNodes();
+            n = nodeDB.getNodeByIndex(nodeIndex);
         }
+
+        // We just changed to a new node screen, ask that node for updated state
+        displayedNodeNum = n->num;
+        service.sendNetworkPing(displayedNodeNum, true);
     }
 
     NodeInfo *node = nodeDB.getNodeByIndex(nodeIndex);
@@ -334,7 +345,7 @@ static void drawNodeInfo(OLEDDisplay *display, OLEDDisplayUiState *state, int16_
     NodeInfo *ourNode = nodeDB.getNode(nodeDB.getNodeNum());
     if (ourNode && hasPosition(ourNode) && hasPosition(node)) {
         Position &op = ourNode->position, &p = node->position;
-        float d = latLongToMeter(p.latitude, p.longitude, op.latitude, op.longitude);
+        float d = latLongToMeter(DegD(p.latitude_i), DegD(p.longitude_i), DegD(op.latitude_i), DegD(op.longitude_i));
         if (d < 2000)
             snprintf(distStr, sizeof(distStr), "%.0f m", d);
         else
@@ -342,8 +353,8 @@ static void drawNodeInfo(OLEDDisplay *display, OLEDDisplayUiState *state, int16_
 
         // FIXME, also keep the guess at the operators heading and add/substract
         // it.  currently we don't do this and instead draw north up only.
-        float bearingToOther = bearing(p.latitude, p.longitude, op.latitude, op.longitude);
-        float myHeading = estimatedHeading(p.latitude, p.longitude);
+        float bearingToOther = bearing(DegD(p.latitude_i), DegD(p.longitude_i), DegD(op.latitude_i), DegD(op.longitude_i));
+        float myHeading = estimatedHeading(DegD(p.latitude_i), DegD(p.longitude_i));
         headingRadian = bearingToOther - myHeading;
     } else {
         // Debug info for gps lock errors
@@ -626,6 +637,8 @@ void Screen::handleOnPress()
 
 void DebugInfo::drawFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
 {
+    displayedNodeNum = 0; // Not currently showing a node pane
+
     display->setFont(ArialMT_Plain_10);
 
     // The coordinates define the left starting point of the text

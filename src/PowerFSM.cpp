@@ -87,7 +87,7 @@ static void lsIdle()
 static void lsExit()
 {
     // setGPSPower(true); // restore GPS power
-    gps.startLock();
+    gps->startLock();
 }
 
 static void nbEnter()
@@ -113,8 +113,9 @@ static void onEnter()
 
     uint32_t now = millis();
 
-    if (now - lastPingMs > 60 * 1000) { // if more than a minute since our last press, ask other nodes to update their state
-        service.sendNetworkPing(NODENUM_BROADCAST, true);
+    if (now - lastPingMs > 30 * 1000) { // if more than a minute since our last press, ask other nodes to update their state
+        if (displayedNodeNum)
+            service.sendNetworkPing(displayedNodeNum, true); // Refresh the currently displayed node
         lastPingMs = now;
     }
 }
@@ -152,6 +153,13 @@ void PowerFSM_setup()
     powerFSM.add_transition(&stateNB, &stateON, EVENT_PRESS, NULL, "Press");
     powerFSM.add_transition(&stateDARK, &stateON, EVENT_PRESS, NULL, "Press");
     powerFSM.add_transition(&stateON, &stateON, EVENT_PRESS, screenPress, "Press"); // reenter On to restart our timers
+
+    // Handle critically low power battery by forcing deep sleep
+    powerFSM.add_transition(&stateBOOT, &stateSDS, EVENT_LOW_BATTERY, NULL, "LowBat");
+    powerFSM.add_transition(&stateLS, &stateSDS, EVENT_LOW_BATTERY, NULL, "LowBat");
+    powerFSM.add_transition(&stateNB, &stateSDS, EVENT_LOW_BATTERY, NULL, "LowBat");
+    powerFSM.add_transition(&stateDARK, &stateSDS, EVENT_LOW_BATTERY, NULL, "LowBat");
+    powerFSM.add_transition(&stateON, &stateSDS, EVENT_LOW_BATTERY, NULL, "LowBat");
 
     powerFSM.add_transition(&stateDARK, &stateON, EVENT_BLUETOOTH_PAIR, NULL, "Bluetooth pairing");
     powerFSM.add_transition(&stateON, &stateON, EVENT_BLUETOOTH_PAIR, NULL, "Bluetooth pairing");

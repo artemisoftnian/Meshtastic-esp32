@@ -1,5 +1,6 @@
 #pragma once
 
+#include "PeriodicTask.h"
 #include "RadioInterface.h"
 
 #include <RadioLib.h>
@@ -11,17 +12,12 @@
 #define INTERRUPT_ATTR
 #endif
 
-class RadioLibInterface : public RadioInterface
+class RadioLibInterface : public RadioInterface, private PeriodicTask
 {
     /// Used as our notification from the ISR
     enum PendingISR { ISR_NONE = 0, ISR_RX, ISR_TX, TRANSMIT_DELAY_COMPLETED };
 
     volatile PendingISR pending = ISR_NONE;
-    volatile bool timerRunning = false;
-
-    /** Our ISR code currently needs this to find our active instance
-     */
-    static RadioLibInterface *instance;
 
     /**
      * Raw ISR handler that just calls our polymorphic method
@@ -57,6 +53,11 @@ class RadioLibInterface : public RadioInterface
     /// are _trying_ to receive a packet currently (note - we might just be waiting for one)
     bool isReceiving;
 
+  public:
+    /** Our ISR code currently needs this to find our active instance
+     */
+    static RadioLibInterface *instance;
+
     /**
      * Glue functions called from ISR land
      */
@@ -80,6 +81,13 @@ class RadioLibInterface : public RadioInterface
      */
     virtual bool canSleep();
 
+    /**
+     * Start waiting to receive a message
+     *
+     * External functions can call this method to wake the device from sleep.
+     */
+    virtual void startReceive() = 0;
+
   private:
     /** start an immediate transmit */
     void startSend(MeshPacket *txp);
@@ -96,22 +104,26 @@ class RadioLibInterface : public RadioInterface
 
     static void timerCallback(void *p1, uint32_t p2);
 
+    virtual void doTask();
+
   protected:
+    /// Initialise the Driver transport hardware and software.
+    /// Make sure the Driver is properly configured before calling init().
+    /// \return true if initialisation succeeded.
+    virtual bool init();
+    
     /**
      * Convert our modemConfig enum into wf, sf, etc...
+     *
+     * These paramaters will be pull from the channelSettings global
      */
-    void applyModemConfig();
+    virtual void applyModemConfig();
 
     /** Could we send right now (i.e. either not actively receiving or transmitting)? */
     virtual bool canSendImmediately();
 
     /** are we actively receiving a packet (only called during receiving state) */
     virtual bool isActivelyReceiving() = 0;
-
-    /**
-     * Start waiting to receive a message
-     */
-    virtual void startReceive() = 0;
 
     /**
      * Raw ISR handler that just calls our polymorphic method

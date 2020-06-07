@@ -46,8 +46,6 @@ MeshService service;
 
 #include "Router.h"
 
-#define NUM_PACKET_ID 255 // 0 is consider invalid
-
 static uint32_t sendOwnerCb()
 {
     service.sendOurOwner();
@@ -56,23 +54,6 @@ static uint32_t sendOwnerCb()
 }
 
 static Periodic sendOwnerPeriod(sendOwnerCb);
-
-/// Generate a unique packet id
-// FIXME, move this someplace better
-PacketId generatePacketId()
-{
-    static uint32_t i; // Note: trying to keep this in noinit didn't help for working across reboots
-    static bool didInit = false;
-
-    if (!didInit) {
-        didInit = true;
-        i = random(0, NUM_PACKET_ID +
-                          1); // pick a random initial sequence number at boot (to prevent repeated reboots always starting at 0)
-    }
-
-    i++;
-    return (i % NUM_PACKET_ID) + 1; // return number between 1 and 255
-}
 
 MeshService::MeshService() : toPhoneQueue(MAX_RX_TOPHONE)
 {
@@ -84,17 +65,17 @@ void MeshService::init()
     sendOwnerPeriod.setup();
     nodeDB.init();
 
-    gpsObserver.observe(&gps);
+    gpsObserver.observe(gps);
     packetReceivedObserver.observe(&router.notifyPacketReceived);
 }
 
 void MeshService::sendOurOwner(NodeNum dest, bool wantReplies)
 {
-    MeshPacket *p = allocForSending();
+    MeshPacket *p = router.allocForSending();
     p->to = dest;
-    p->payload.want_response = wantReplies;
-    p->payload.has_user = true;
-    User &u = p->payload.user;
+    p->decoded.want_response = wantReplies;
+    p->decoded.which_payload = SubPacket_user_tag;
+    User &u = p->decoded.user;
     u = owner;
     DEBUG_MSG("sending owner %s/%s/%s\n", u.id, u.long_name, u.short_name);
 
@@ -108,7 +89,7 @@ const MeshPacket *MeshService::handleFromRadioUser(const MeshPacket *mp)
     bool isCollision = mp->from == myNodeInfo.my_node_num;
 
     // we win if we have a lower macaddr
-    bool weWin = memcmp(&owner.macaddr, &mp->payload.user.macaddr, sizeof(owner.macaddr)) < 0;
+    bool weWin = memcmp(&owner.macaddr, &mp->decoded.user.macaddr, sizeof(owner.macaddr)) < 0;
 
     if (isCollision) {
         if (weWin) {
@@ -134,7 +115,7 @@ const MeshPacket *MeshService::handleFromRadioUser(const MeshPacket *mp)
 
         sendOurOwner(mp->from);
 
-        String lcd = String("Joined: ") + mp->payload.user.long_name + "\n";
+        String lcd = String("Joined: ") + mp->decoded.user.long_name + "\n";
         screen.print(lcd.c_str());
     }
 
@@ -143,17 +124,17 @@ const MeshPacket *MeshService::handleFromRadioUser(const MeshPacket *mp)
 
 void MeshService::handleIncomingPosition(const MeshPacket *mp)
 {
-    if (mp->has_payload && mp->payload.has_position) {
-        DEBUG_MSG("handled incoming position time=%u\n", mp->payload.position.time);
+    if (mp->which_payload == MeshPacket_decoded_tag && mp->decoded.which_payload == SubPacket_position_tag) {
+        DEBUG_MSG("handled incoming position time=%u\n", mp->decoded.position.time);
 
-        if (mp->payload.position.time) {
+        if (mp->decoded.position.time) {
             struct timeval tv;
-            uint32_t secs = mp->payload.position.time;
+            uint32_t secs = mp->decoded.position.time;
 
             tv.tv_sec = secs;
             tv.tv_usec = 0;
 
-            gps.perhapsSetRTC(&tv);
+            perhapsSetRTC(&tv);
         }
     } else {
         DEBUG_MSG("Ignoring incoming packet - not a position\n");
@@ -165,13 +146,13 @@ int MeshService::handleFromRadio(const MeshPacket *mp)
     powerFSM.trigger(EVENT_RECEIVED_PACKET); // Possibly keep the node from sleeping
 
     // If it is a position packet, perhaps set our clock (if we don't have a GPS of our own, otherwise wait for that to work)
-    if (!gps.isConnected)
+    if (!gps->isConnected)
         handleIncomingPosition(mp);
     else {
         DEBUG_MSG("Ignoring incoming time, because we have a GPS\n");
     }
 
-    if (mp->has_payload && mp->payload.has_user) {
+    if (mp->which_payload == MeshPacket_decoded_tag && mp->decoded.which_payload == SubPacket_user_tag) {
         mp = handleFromRadioUser(mp);
     }
 
@@ -192,7 +173,7 @@ int MeshService::handleFromRadio(const MeshPacket *mp)
         MeshPacket *copied = packetPool.allocCopy(*mp);
         assert(toPhoneQueue.enqueue(copied, 0)); // FIXME, instead of failing for full queue, delete the oldest mssages
 
-        if (mp->payload.want_response)
+        if (mp->decoded.want_response)
             sendNetworkPing(mp->from);
     } else {
         DEBUG_MSG("Not delivering vetoed User message\n");
@@ -234,8 +215,8 @@ void MeshService::handleToRadio(MeshPacket &p)
     if (p.id == 0)
         p.id = generatePacketId(); // If the phone didn't supply one, then pick one
 
-    p.rx_time = gps.getValidTime(); // Record the time the packet arrived from the phone
-                                    // (so we update our nodedb for the local node)
+    p.rx_time = getValidTime(); // Record the time the packet arrived from the phone
+                                // (so we update our nodedb for the local node)
 
     // Send the packet into the mesh
 
@@ -257,39 +238,16 @@ void MeshService::sendToMesh(MeshPacket *p)
     // Strip out any time information before sending packets to other  nodes - to keep the wire size small (and because other
     // nodes shouldn't trust it anyways) Note: for now, we allow a device with a local GPS to include the time, so that gpsless
     // devices can get time.
-    if (p->has_payload && p->payload.has_position) {
-        if (!gps.isConnected) {
-            DEBUG_MSG("Stripping time %u from position send\n", p->payload.position.time);
-            p->payload.position.time = 0;
+    if (p->which_payload == MeshPacket_decoded_tag && p->decoded.which_payload == SubPacket_position_tag) {
+        if (!gps->isConnected) {
+            DEBUG_MSG("Stripping time %u from position send\n", p->decoded.position.time);
+            p->decoded.position.time = 0;
         } else
-            DEBUG_MSG("Providing time to mesh %u\n", p->payload.position.time);
+            DEBUG_MSG("Providing time to mesh %u\n", p->decoded.position.time);
     }
 
-    // If the phone sent a packet just to us, don't send it out into the network
-    if (p->to == nodeDB.getNodeNum()) {
-        DEBUG_MSG("Dropping locally processed message\n");
-        releaseToPool(p);
-    }
-    else {
-        // Note: We might return !OK if our fifo was full, at that point the only option we have is to drop it
-        if (router.send(p) != ERRNO_OK) {
-            DEBUG_MSG("No radio was able to send packet, discarding...\n");
-            releaseToPool(p);
-        }
-    }
-}
-
-MeshPacket *MeshService::allocForSending()
-{
-    MeshPacket *p = packetPool.allocZeroed();
-
-    p->has_payload = true;
-    p->from = nodeDB.getNodeNum();
-    p->to = NODENUM_BROADCAST;
-    p->id = generatePacketId();
-    p->rx_time = gps.getValidTime(); // Just in case we process the packet locally - make sure it has a valid timestamp
-
-    return p;
+    // Note: We might return !OK if our fifo was full, at that point the only option we have is to drop it
+    router.sendLocal(p);
 }
 
 void MeshService::sendNetworkPing(NodeNum dest, bool wantReplies)
@@ -311,12 +269,12 @@ void MeshService::sendOurPosition(NodeNum dest, bool wantReplies)
     assert(node->has_position);
 
     // Update our local node info with our position (even if we don't decide to update anyone else)
-    MeshPacket *p = allocForSending();
+    MeshPacket *p = router.allocForSending();
     p->to = dest;
-    p->payload.has_position = true;
-    p->payload.position = node->position;
-    p->payload.want_response = wantReplies;
-    p->payload.position.time = gps.getValidTime(); // This nodedb timestamp might be stale, so update it if our clock is valid.
+    p->decoded.which_payload = SubPacket_position_tag;
+    p->decoded.position = node->position;
+    p->decoded.want_response = wantReplies;
+    p->decoded.position.time = getValidTime(); // This nodedb timestamp might be stale, so update it if our clock is valid.
     sendToMesh(p);
 }
 
@@ -325,17 +283,17 @@ int MeshService::onGPSChanged(void *unused)
     // DEBUG_MSG("got gps notify\n");
 
     // Update our local node info with our position (even if we don't decide to update anyone else)
-    MeshPacket *p = allocForSending();
-    p->payload.has_position = true;
+    MeshPacket *p = router.allocForSending();
+    p->decoded.which_payload = SubPacket_position_tag;
 
-    Position &pos = p->payload.position;
+    Position &pos = p->decoded.position;
     // !zero or !zero lat/long means valid
-    if (gps.latitude != 0 || gps.longitude != 0) {
-        if (gps.altitude != 0)
-            pos.altitude = gps.altitude;
-        pos.latitude = gps.latitude;
-        pos.longitude = gps.longitude;
-        pos.time = gps.getValidTime();
+    if (gps->latitude != 0 || gps->longitude != 0) {
+        if (gps->altitude != 0)
+            pos.altitude = gps->altitude;
+        pos.latitude_i = gps->latitude;
+        pos.longitude_i = gps->longitude;
+        pos.time = getValidTime();
     }
 
     // We limit our GPS broadcasts to a max rate

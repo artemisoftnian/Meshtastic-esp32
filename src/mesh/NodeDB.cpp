@@ -5,9 +5,12 @@
 #include "FS.h"
 #include "SPIFFS.h"
 
+#include "CryptoEngine.h"
 #include "GPS.h"
 #include "NodeDB.h"
+#include "PacketHistory.h"
 #include "PowerFSM.h"
+#include "Router.h"
 #include "configuration.h"
 #include "error.h"
 #include "mesh-pb-constants.h"
@@ -27,11 +30,19 @@ DeviceState versions used to be defined in the .proto file but really only this 
 #define here.
 */
 
-#define DEVICESTATE_CUR_VER 7
+#define DEVICESTATE_CUR_VER 8
 #define DEVICESTATE_MIN_VER DEVICESTATE_CUR_VER
 
 #ifndef NO_ESP32
 #define FS SPIFFS
+#define FSBegin() FS.begin(true)
+#define FILE_O_WRITE "w"
+#define FILE_O_READ "r"
+#else
+#include "InternalFileSystem.h"
+#define FS InternalFS
+#define FSBegin() FS.begin()
+using namespace Adafruit_LittleFS_Namespace;
 #endif
 
 // FIXME - move this somewhere else
@@ -47,11 +58,17 @@ User &owner = devicestate.owner;
 
 static uint8_t ourMacAddr[6];
 
+/**
+ * The node number the user is currently looking at
+ * 0 if none
+ */
+NodeNum displayedNodeNum;
+
 NodeDB::NodeDB() : nodes(devicestate.node_db), numNodes(&devicestate.node_db_count) {}
 
 void NodeDB::resetRadioConfig()
 {
-    /// 16 bytes of random PSK for our _public_ default channel that all devices power up on
+    /// 16 bytes of random PSK for our _public_ default channel that all devices power up on (AES128)
     static const uint8_t defaultpsk[] = {0xd4, 0xf1, 0xbb, 0x3a, 0x20, 0x29, 0x07, 0x59,
                                          0xf0, 0xbc, 0xff, 0xab, 0xcf, 0x4e, 0x69, 0xbf};
 
@@ -75,9 +92,13 @@ void NodeDB::resetRadioConfig()
         channelSettings.modem_config = ChannelSettings_ModemConfig_Bw125Cr48Sf4096; // slow and long range
 
         channelSettings.tx_power = 23;
-        memcpy(&channelSettings.psk, &defaultpsk, sizeof(channelSettings.psk));
+        memcpy(&channelSettings.psk.bytes, &defaultpsk, sizeof(channelSettings.psk));
+        channelSettings.psk.size = sizeof(defaultpsk);
         strcpy(channelSettings.name, "Default");
     }
+
+    // Tell our crypto engine about the psk
+    crypto->setKey(channelSettings.psk.size, channelSettings.psk.bytes);
 
     // temp hack for quicker testing
     /*
@@ -93,7 +114,6 @@ void NodeDB::init()
     devicestate.has_my_node = true;
     devicestate.has_radio = true;
     devicestate.has_owner = true;
-    devicestate.has_radio = false;
     devicestate.radio.has_channel_settings = true;
     devicestate.radio.has_preferences = true;
     devicestate.node_db_count = 0;
@@ -103,24 +123,33 @@ void NodeDB::init()
 
     // default to no GPS, until one has been found by probing
     myNodeInfo.has_gps = false;
-
-    strncpy(myNodeInfo.region, xstr(HW_VERSION), sizeof(myNodeInfo.region));
-    strncpy(myNodeInfo.firmware_version, xstr(APP_VERSION), sizeof(myNodeInfo.firmware_version));
-    strncpy(myNodeInfo.hw_model, HW_VENDOR, sizeof(myNodeInfo.hw_model));
+    myNodeInfo.node_num_bits = sizeof(NodeNum) * 8;
+    myNodeInfo.packet_id_bits = sizeof(PacketId) * 8;
+    myNodeInfo.message_timeout_msec = FLOOD_EXPIRE_TIME;
+    myNodeInfo.min_app_version = 167;
+    generatePacketId(); // FIXME - ugly way to init current_packet_id;
 
     // Init our blank owner info to reasonable defaults
     getMacAddr(ourMacAddr);
     sprintf(owner.id, "!%02x%02x%02x%02x%02x%02x", ourMacAddr[0], ourMacAddr[1], ourMacAddr[2], ourMacAddr[3], ourMacAddr[4],
             ourMacAddr[5]);
     memcpy(owner.macaddr, ourMacAddr, sizeof(owner.macaddr));
-
-    // make each node start with ad different random seed (but okay that the sequence is the same each boot)
-    randomSeed((ourMacAddr[2] << 24L) | (ourMacAddr[3] << 16L) | (ourMacAddr[4] << 8L) | ourMacAddr[5]);
-
     sprintf(owner.long_name, "Unknown %02x%02x", ourMacAddr[4], ourMacAddr[5]);
-    sprintf(owner.short_name, "?%02X", ourMacAddr[5]);
 
-    // Crummy guess at our nodenum
+    sprintf(owner.short_name, "?%02X", myNodeInfo.my_node_num & 0xff);
+
+    if (!FSBegin()) // FIXME - do this in main?
+    {
+        DEBUG_MSG("ERROR filesystem mount Failed\n");
+        // FIXME - report failure to phone
+    }
+
+    // saveToDisk();
+    loadFromDisk();
+    // saveToDisk();
+
+    // Note! We do this after loading saved settings, so that if somehow an invalid nodenum was stored in preferences we won't
+    // keep using that nodenum forever. Crummy guess at our nodenum (but we will check against the nodedb to avoid conflicts)
     pickNewNodeNum();
 
     // Include our owner in the node db under our nodenum
@@ -128,8 +157,12 @@ void NodeDB::init()
     info->user = owner;
     info->has_user = true;
 
-    // saveToDisk();
-    loadFromDisk();
+    // We set these _after_ loading from disk - because they come from the build and are more trusted than
+    // what is stored in flash
+    strncpy(myNodeInfo.region, optstr(HW_VERSION), sizeof(myNodeInfo.region));
+    strncpy(myNodeInfo.firmware_version, optstr(APP_VERSION), sizeof(myNodeInfo.firmware_version));
+    strncpy(myNodeInfo.hw_model, HW_VENDOR, sizeof(myNodeInfo.hw_model));
+
     resetRadioConfig(); // If bogus settings got saved, then fix them
 
     DEBUG_MSG("NODENUM=0x%x, dbsize=%d\n", myNodeInfo.my_node_num, *numNodes);
@@ -143,9 +176,14 @@ void NodeDB::init()
  */
 void NodeDB::pickNewNodeNum()
 {
-    // FIXME not the right way to guess node numes
-    uint8_t r = ourMacAddr[5];
-    if (r == 0xff || r < NUM_RESERVED)
+    NodeNum r = myNodeInfo.my_node_num;
+
+    // If we don't have a nodenum at app - pick an initial nodenum based on the macaddr
+    if (r == 0)
+        r = sizeof(NodeNum) == 1 ? ourMacAddr[5]
+                                 : ((ourMacAddr[2] << 24) | (ourMacAddr[3] << 16) | (ourMacAddr[4] << 8) | ourMacAddr[5]);
+
+    if (r == NODENUM_BROADCAST || r < NUM_RESERVED)
         r = NUM_RESERVED; // don't pick a reserved node number
 
     NodeInfo *found;
@@ -166,13 +204,7 @@ void NodeDB::loadFromDisk()
 #ifdef FS
     static DeviceState scratch;
 
-    if (!FS.begin(true)) // FIXME - do this in main?
-    {
-        DEBUG_MSG("ERROR SPIFFS Mount Failed\n");
-        // FIXME - report failure to phone
-    }
-
-    File f = FS.open(preffile);
+    auto f = FS.open(preffile);
     if (f) {
         DEBUG_MSG("Loading saved preferences\n");
         pb_istream_t stream = {&readcb, &f, DeviceState_size};
@@ -206,7 +238,7 @@ void NodeDB::loadFromDisk()
 void NodeDB::saveToDisk()
 {
 #ifdef FS
-    File f = FS.open(preftmp, "w");
+    auto f = FS.open(preftmp, FILE_O_WRITE);
     if (f) {
         DEBUG_MSG("Writing preferences\n");
 
@@ -218,15 +250,18 @@ void NodeDB::saveToDisk()
         if (!pb_encode(&stream, DeviceState_fields, &devicestate)) {
             DEBUG_MSG("Error: can't write protobuf %s\n", PB_GET_ERROR(&stream));
             // FIXME - report failure to phone
+
+            f.close();
+        } else {
+            // Success - replace the old file
+            f.close();
+
+            // brief window of risk here ;-)
+            if (!FS.remove(preffile))
+                DEBUG_MSG("Warning: Can't remove old pref file\n");
+            if (!FS.rename(preftmp, preffile))
+                DEBUG_MSG("Error: can't rename new pref file\n");
         }
-
-        f.close();
-
-        // brief window of risk here ;-)
-        if (!FS.remove(preffile))
-            DEBUG_MSG("Warning: Can't remove old pref file\n");
-        if (!FS.rename(preftmp, preffile))
-            DEBUG_MSG("Error: can't rename new pref file\n");
     } else {
         DEBUG_MSG("ERROR: can't write prefs\n"); // FIXME report to app
     }
@@ -246,7 +281,7 @@ const NodeInfo *NodeDB::readNextInfo()
 /// Given a node, return how many seconds in the past (vs now) that we last heard from it
 uint32_t sinceLastSeen(const NodeInfo *n)
 {
-    uint32_t now = gps.getTime();
+    uint32_t now = getTime();
 
     uint32_t last_seen = n->position.time;
     int delta = (int)(now - last_seen);
@@ -274,8 +309,8 @@ size_t NodeDB::getNumOnlineNodes()
 /// we updateGUI and updateGUIforNode if we think our this change is big enough for a redraw
 void NodeDB::updateFrom(const MeshPacket &mp)
 {
-    if (mp.has_payload) {
-        const SubPacket &p = mp.payload;
+    if (mp.which_payload == MeshPacket_decoded_tag) {
+        const SubPacket &p = mp.decoded;
         DEBUG_MSG("Update DB node 0x%x, rx_time=%u\n", mp.from, mp.rx_time);
 
         int oldNumNodes = *numNodes;
@@ -291,16 +326,18 @@ void NodeDB::updateFrom(const MeshPacket &mp)
 
         info->snr = mp.rx_snr; // keep the most recent SNR we received for this node.
 
-        if (p.has_position) {
+        switch (p.which_payload) {
+        case SubPacket_position_tag: {
             // we carefully preserve the old time, because we always trust our local timestamps more
             uint32_t oldtime = info->position.time;
             info->position = p.position;
             info->position.time = oldtime;
             info->has_position = true;
             updateGUIforNode = info;
+            break;
         }
 
-        if (p.has_data) {
+        case SubPacket_data_tag: {
             // Keep a copy of the most recent text message.
             if (p.data.typ == Data_Type_CLEAR_TEXT) {
                 DEBUG_MSG("Received text msg from=0x%0x, id=%d, msg=%.*s\n", mp.from, mp.id, p.data.payload.size,
@@ -313,9 +350,10 @@ void NodeDB::updateFrom(const MeshPacket &mp)
                     powerFSM.trigger(EVENT_RECEIVED_TEXT_MSG);
                 }
             }
+            break;
         }
 
-        if (p.has_user) {
+        case SubPacket_user_tag: {
             DEBUG_MSG("old user %s/%s/%s\n", info->user.id, info->user.long_name, info->user.short_name);
 
             bool changed = memcmp(&info->user, &p.user,
@@ -333,6 +371,8 @@ void NodeDB::updateFrom(const MeshPacket &mp)
                 // We just changed something important about the user, store our DB
                 // saveToDisk();
             }
+            break;
+        }
         }
     }
 }

@@ -21,18 +21,18 @@
 
 */
 
-#include "GPS.h"
 #include "MeshRadio.h"
 #include "MeshService.h"
+#include "NEMAGPS.h"
 #include "NodeDB.h"
 #include "Periodic.h"
 #include "PowerFSM.h"
-#include "Router.h"
+#include "UBloxGPS.h"
 #include "configuration.h"
 #include "error.h"
 #include "power.h"
 // #include "rom/rtc.h"
-#include "FloodingRouter.h"
+#include "DSRRouter.h"
 #include "main.h"
 #include "screen.h"
 #include "sleep.h"
@@ -52,7 +52,7 @@ meshtastic::PowerStatus powerStatus;
 bool ssd1306_found;
 bool axp192_found;
 
-FloodingRouter realRouter;
+DSRRouter realRouter;
 Router &router = realRouter; // Users of router don't care what sort of subclass implements that API
 
 // -----------------------------------------------------------------------------
@@ -102,8 +102,6 @@ const char *getDeviceName()
     sprintf(name, "Meshtastic_%02x%02x", dmac[4], dmac[5]);
     return name;
 }
-
-static MeshRadio *radio = NULL;
 
 static uint32_t ledBlinker()
 {
@@ -168,7 +166,7 @@ void setup()
     ledPeriodic.setup();
 
     // Hello
-    DEBUG_MSG("Meshtastic swver=%s, hwver=%s\n", xstr(APP_VERSION), xstr(HW_VERSION));
+    DEBUG_MSG("Meshtastic swver=%s, hwver=%s\n", optstr(APP_VERSION), optstr(HW_VERSION));
 
 #ifndef NO_ESP32
     // Don't init display if we don't have one or we are waking headless due to a timer event
@@ -188,12 +186,26 @@ void setup()
 
     screen.print("Started...\n");
 
-    // Init GPS
-    gps.setup();
+    readFromRTC(); // read the main CPU RTC at first (in case we can't get GPS time)
+
+// If we know we have a L80 GPS, don't try UBLOX
+#ifndef L80_RESET
+    // Init GPS - first try ublox
+    gps = new UBloxGPS();
+    if (!gps->setup()) {
+        // Some boards might have only the TX line from the GPS connected, in that case, we can't configure it at all.  Just
+        // assume NEMA at 9600 baud.
+        DEBUG_MSG("ERROR: No UBLOX GPS found, hoping that NEMA might work\n");
+        delete gps;
+        gps = new NEMAGPS();
+        gps->setup();
+    }
+#else
+    gps = new NEMAGPS();
+    gps->setup();
+#endif
 
     service.init();
-
-    realRouter.setup(); // required for our periodic task (kinda skanky FIXME)
 
 #ifdef SX1262_ANT_SW
     // make analog PA vs not PA switch on SX1262 eval board work properly
@@ -220,11 +232,11 @@ void setup()
 #else
         new SimRadio();
 #endif
-    radio = new MeshRadio(rIf);
-    router.addInterface(&radio->radioIf);
 
-    if (radio && !radio->init())
+    if (!rIf->init())
         recordCriticalError(ErrNoRadio);
+    else
+        router.addInterface(rIf);
 
     // This must be _after_ service.init because we need our preferences loaded from flash to have proper timeout values
     PowerFSM_setup(); // we will transition to ON in a couple of seconds, FIXME, only do this for cold boots, not waking from SDS
@@ -258,6 +270,7 @@ void loop()
 {
     uint32_t msecstosleep = 1000 * 30; // How long can we sleep before we again need to service the main loop?
 
+    gps->loop(); // FIXME, remove from main, instead block on read
     router.loop();
     powerFSM.run_machine();
     service.loop();
@@ -306,7 +319,7 @@ void loop()
     screen.debug()->setChannelNameStatus(channelSettings.name);
     screen.debug()->setPowerStatus(powerStatus);
     // TODO(#4): use something based on hdop to show GPS "signal" strength.
-    screen.debug()->setGPSStatus(gps.hasLock() ? "ok" : ":(");
+    screen.debug()->setGPSStatus(gps->hasLock() ? "good" : "bad");
 
     // No GPS lock yet, let the OS put the main CPU in low power mode for 100ms (or until another interrupt comes in)
     // i.e. don't just keep spinning in loop as fast as we can.
